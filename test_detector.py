@@ -19,6 +19,7 @@ class TestConfig(unittest.TestCase):
     
     def test_config_with_defaults(self):
         """Test config loads with default values"""
+        print("\n  [Config] Testing default configuration loading...")
         with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
             f.write("clickhouse:\n  host: testhost\n")
             config_path = f.name
@@ -32,6 +33,7 @@ class TestConfig(unittest.TestCase):
     
     def test_config_environment_override(self):
         """Test environment variables override config file"""
+        print("  [Config] Testing environment variable override...")
         with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
             f.write("clickhouse:\n  host: filehost\n")
             config_path = f.name
@@ -68,16 +70,19 @@ notifications:
     
     def test_should_notify_first_time(self):
         """Test notification allowed on first occurrence"""
+        print("  [Notification] Testing first-time notification allowance...")
         self.assertTrue(self.notifier._should_notify("192.168.1.1"))
     
     def test_should_notify_cooldown(self):
         """Test cooldown period prevents duplicate notifications"""
+        print("  [Notification] Testing cooldown period blocking...")
         target = "192.168.1.1"
         self.notifier.last_notifications[target] = datetime.now()
         self.assertFalse(self.notifier._should_notify(target))
     
     def test_format_message(self):
         """Test message formatting"""
+        print("  [Notification] Testing message formatting...")
         attack_info = {
             'dst_ip': '192.168.1.1',
             'bps': 1500000000,
@@ -93,6 +98,7 @@ notifications:
     @patch('requests.post')
     def test_send_discord(self, mock_post):
         """Test Discord notification sending"""
+        print("  [Notification] Testing Discord webhook sending...")
         mock_post.return_value.status_code = 200
         attack_info = {
             'dst_ip': '192.168.1.1',
@@ -108,6 +114,7 @@ notifications:
     @patch('requests.post')
     def test_send_slack(self, mock_post):
         """Test Slack notification sending"""
+        print("  [Notification] Testing Slack webhook sending...")
         mock_post.return_value.status_code = 200
         attack_info = {
             'dst_ip': '192.168.1.1',
@@ -147,26 +154,34 @@ detection:
     
     def test_entropy_calculation(self):
         """Test normalized entropy calculation"""
+        print("  [Detection] Testing entropy calculation...")
         # Test case 1: Evenly distributed sources (high entropy)
+        print("    - Case 1: Evenly distributed sources (high entropy)")
         src_ips = ['10.0.0.1', '10.0.0.2', '10.0.0.3', '10.0.0.4']
         src_bytes = [250, 250, 250, 250]
         entropy = ddos_detector.DDoSDetector.calculate_normalized_entropy(src_ips, src_bytes)
+        print(f"      Entropy: {entropy:.4f} (expected > 0.95)")
         self.assertGreater(entropy, 0.95)  # Should be close to 1.0
         
         # Test case 2: Single dominant source (low entropy)
+        print("    - Case 2: Single dominant source (low entropy)")
         src_ips = ['10.0.0.1', '10.0.0.2']
         src_bytes = [950, 50]
         entropy = ddos_detector.DDoSDetector.calculate_normalized_entropy(src_ips, src_bytes)
+        print(f"      Entropy: {entropy:.4f} (expected < 0.5)")
         self.assertLess(entropy, 0.5)  # Should be low
         
         # Test case 3: Empty list
+        print("    - Case 3: Empty list")
         entropy = ddos_detector.DDoSDetector.calculate_normalized_entropy([], [])
+        print(f"      Entropy: {entropy:.4f} (expected = 0.0)")
         self.assertEqual(entropy, 0.0)
     
     @patch('ddos_detector.ClickHouseClient')
     @patch('ddos_detector.NotificationManager')
     def test_detect_ddos_attack(self, mock_notifier, mock_db):
         """Test detection of DDoS attack (high entropy)"""
+        print("  [Detection] Testing DDoS attack detection (high entropy)...")
         # Mock database client
         mock_db_instance = Mock()
         mock_db_instance.get_total_external_traffic.return_value = 2000000000  # 2 Gbps
@@ -195,11 +210,13 @@ detection:
         self.assertEqual(len(attacks), 1)
         self.assertEqual(attacks[0]['dst_ip'], '192.168.1.1')
         self.assertEqual(attacks[0]['attack_type'], 'DDoS')
+        print(f"    ✓ Detected {attacks[0]['attack_type']} attack on {attacks[0]['dst_ip']} (entropy: {attacks[0].get('entropy', 0):.4f})")
     
     @patch('ddos_detector.ClickHouseClient')
     @patch('ddos_detector.NotificationManager')
     def test_detect_dos_attack(self, mock_notifier, mock_db):
         """Test detection of DoS attack (low entropy)"""
+        print("  [Detection] Testing DoS attack detection (low entropy)...")
         # Mock database client
         mock_db_instance = Mock()
         mock_db_instance.get_total_external_traffic.return_value = 2000000000  # 2 Gbps
@@ -228,11 +245,13 @@ detection:
         self.assertEqual(len(attacks), 1)
         self.assertEqual(attacks[0]['dst_ip'], '192.168.1.1')
         self.assertEqual(attacks[0]['attack_type'], 'DoS')
+        print(f"    ✓ Detected {attacks[0]['attack_type']} attack on {attacks[0]['dst_ip']} (entropy: {attacks[0].get('entropy', 0):.4f})")
     
     @patch('ddos_detector.ClickHouseClient')
     @patch('ddos_detector.NotificationManager')
     def test_no_detection_below_threshold(self, mock_notifier, mock_db):
         """Test no detection when below threshold"""
+        print("  [Detection] Testing no detection when below threshold...")
         # Mock database client
         mock_db_instance = Mock()
         mock_db_instance.get_total_external_traffic.return_value = 500000000  # 0.5 Gbps - below threshold
@@ -251,8 +270,12 @@ detection:
         
         # Verify no attacks detected
         self.assertEqual(len(attacks), 0)
+        print("    ✓ No attacks detected (traffic below threshold)")
 
 
 if __name__ == '__main__':
     # Run tests
-    unittest.main()
+    print("\n" + "="*60)
+    print("🧪 Akvorado DDoS Detector - Test Suite")
+    print("="*60)
+    unittest.main(verbosity=2)
