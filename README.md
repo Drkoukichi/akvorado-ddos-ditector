@@ -54,12 +54,22 @@ When thresholds are exceeded, alerts are sent to configured notification channel
    - Configure ClickHouse connection details
    - Adjust detection thresholds as needed
 
-5. **Start the detector:**
+5. **Test your webhooks (optional):**
+   ```bash
+   python examples/test_notifications.py <your_webhook_url>
+   ```
+
+6. **Start the detector:**
    ```bash
    docker-compose up -d
    ```
+   
+   Or use the quick start script:
+   ```bash
+   bash examples/quick_start.sh
+   ```
 
-6. **View logs:**
+7. **View logs:**
    ```bash
    docker-compose logs -f ddos-detector
    ```
@@ -168,6 +178,33 @@ The included `docker-compose.yml` includes a ClickHouse service for testing. For
 ```bash
 docker-compose up -d ddos-detector
 ```
+
+## Examples
+
+The `examples/` directory contains helpful scripts:
+
+### Test Notifications
+
+Test your Discord or Slack webhook before deploying:
+
+```bash
+python examples/test_notifications.py https://discord.com/api/webhooks/...
+python examples/test_notifications.py https://hooks.slack.com/services/...
+```
+
+### Quick Start Script
+
+Automated setup and deployment:
+
+```bash
+bash examples/quick_start.sh
+```
+
+This script will:
+- Check for Docker installation
+- Create configuration files from templates
+- Build the Docker image
+- Start the detector
 
 ## Monitoring and Maintenance
 
