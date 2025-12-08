@@ -13,14 +13,30 @@ A Python-based DDoS detection system that monitors network flow data from Akvora
 
 ## How It Works
 
-The detector queries Akvorado's ClickHouse database at regular intervals to analyze network flow data. It aggregates traffic statistics per destination IP and checks against configurable thresholds:
+The detector uses a three-step approach to identify DoS and DDoS attacks:
 
-- **Packets Per Second (PPS)** - Detects high packet rate attacks
-- **Bytes Per Second (BPS)** - Detects volumetric attacks
-- **Unique Source IPs** - Detects distributed attacks
-- **Flows Per Second (FPS)** - Detects connection flood attacks
+### Detection Logic
 
-When thresholds are exceeded, alerts are sent to configured notification channels with detailed attack information.
+1. **Total External Traffic Check**
+   - Monitors total traffic where `InIfBoundary = external`
+   - Only proceeds if total traffic exceeds 1 Gbps (configurable)
+
+2. **Per-Destination Analysis**
+   - Identifies destination IPs with traffic exceeding 1 Gbps (configurable)
+   - Collects source IP distribution data
+
+3. **Attack Classification**
+   - Calculates **Normalized Entropy** of source IP distribution
+   - **High Entropy (> 0.8)**: Traffic distributed across many sources → **DDoS Attack**
+   - **Low Entropy (≤ 0.8)**: Traffic concentrated in few sources → **DoS Attack**
+
+### Entropy-Based Classification
+
+Normalized entropy measures how evenly distributed the attack traffic is across source IPs:
+- **DDoS**: Many attackers, high entropy (distributed attack)
+- **DoS**: Single or few attackers, low entropy (concentrated attack)
+
+When attacks are detected, alerts are sent to configured notification channels (Discord/Slack) with attack type, traffic volume, entropy value, and source count.
 
 ## Prerequisites
 
@@ -110,10 +126,14 @@ detection:
   check_interval: 60        # Check every 60 seconds
   time_window: 300          # Analyze last 5 minutes
   thresholds:
-    pps_threshold: 100000   # 100k packets/sec
-    bps_threshold: 1000000000  # 1 Gbps
-    unique_sources_threshold: 1000
-    fps_threshold: 10000
+    # Step 1: Total external traffic threshold
+    total_external_bps_threshold: 1000000000  # 1 Gbps
+    
+    # Step 2: Per-destination threshold
+    dst_bps_threshold: 1000000000  # 1 Gbps
+    
+    # Step 3: Entropy threshold for DoS vs DDoS classification
+    entropy_threshold: 0.8  # > 0.8 = DDoS, ≤ 0.8 = DoS
 
 notifications:
   discord_webhook: "https://discord.com/api/webhooks/..."
@@ -127,7 +147,7 @@ All configuration options can be set via environment variables:
 
 - `CLICKHOUSE_HOST`, `CLICKHOUSE_PORT`, `CLICKHOUSE_DATABASE`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`
 - `CHECK_INTERVAL`, `TIME_WINDOW`
-- `PPS_THRESHOLD`, `BPS_THRESHOLD`, `UNIQUE_SOURCES_THRESHOLD`, `FPS_THRESHOLD`
+- `TOTAL_EXTERNAL_BPS_THRESHOLD`, `DST_BPS_THRESHOLD`, `ENTROPY_THRESHOLD`
 - `DISCORD_WEBHOOK`, `SLACK_WEBHOOK`, `NOTIFICATION_COOLDOWN`
 - `LOG_LEVEL`, `LOG_FILE`
 
@@ -222,9 +242,16 @@ tail -f logs/ddos_detector.log
 
 Monitor the logs to understand normal traffic patterns and adjust thresholds accordingly:
 
-- Start with high thresholds to avoid false positives
-- Gradually lower thresholds based on your network baseline
-- Different networks require different thresholds
+**Traffic Thresholds:**
+- `total_external_bps_threshold`: Set based on your expected total external traffic
+- `dst_bps_threshold`: Set based on typical per-destination traffic volumes
+- Start with 1 Gbps (default) and adjust based on your network capacity
+
+**Entropy Threshold (0.0 - 1.0):**
+- **Higher values (e.g., 0.9)**: Only highly distributed attacks classified as DDoS (stricter)
+- **Lower values (e.g., 0.6)**: More attacks classified as DDoS (looser)
+- **Default 0.8**: Balanced classification
+- Monitor logs to see entropy values for actual attacks and tune accordingly
 
 ### Notification Cooldown
 

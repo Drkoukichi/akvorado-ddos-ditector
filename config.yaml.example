@@ -17,19 +17,20 @@ detection:
   # Time window for analysis in seconds
   time_window: 300
   
-  # Thresholds for DDoS detection
+  # Thresholds for DoS/DDoS detection
   thresholds:
-    # Packets per second threshold
-    pps_threshold: 100000
+    # Total external traffic threshold (bytes per second)
+    # Detection only triggers if total external traffic exceeds this
+    total_external_bps_threshold: 1000000000  # 1 Gbps
     
-    # Bytes per second threshold (in bytes)
-    bps_threshold: 1000000000  # 1 Gbps
+    # Per-destination traffic threshold (bytes per second)
+    # Individual destinations are checked if they exceed this
+    dst_bps_threshold: 1000000000  # 1 Gbps
     
-    # Number of unique source IPs threshold
-    unique_sources_threshold: 1000
-    
-    # Flows per second threshold
-    fps_threshold: 10000
+    # Entropy threshold to distinguish DoS from DDoS
+    # Values > this threshold indicate DDoS (distributed attack)
+    # Values <= this threshold indicate DoS (single or few sources)
+    entropy_threshold: 0.8
 
 # Notification Settings
 notifications:

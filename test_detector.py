@@ -80,16 +80,15 @@ notifications:
         """Test message formatting"""
         attack_info = {
             'dst_ip': '192.168.1.1',
-            'pps': 150000,
             'bps': 1500000000,
-            'fps': 15000,
+            'entropy': 0.85,
             'unique_sources': 2000,
-            'packets': 45000000,
-            'bytes': 450000000000
+            'attack_type': 'DDoS'
         }
         message = self.notifier._format_message(attack_info)
         self.assertIn('192.168.1.1', message)
-        self.assertIn('150,000', message)
+        self.assertIn('DDoS', message)
+        self.assertIn('0.8500', message)
     
     @patch('requests.post')
     def test_send_discord(self, mock_post):
@@ -97,12 +96,10 @@ notifications:
         mock_post.return_value.status_code = 200
         attack_info = {
             'dst_ip': '192.168.1.1',
-            'pps': 150000,
             'bps': 1500000000,
-            'fps': 15000,
+            'entropy': 0.85,
             'unique_sources': 2000,
-            'packets': 45000000,
-            'bytes': 450000000000
+            'attack_type': 'DDoS'
         }
         message = "Test message"
         self.notifier._send_discord("https://discord.com/test", message, attack_info)
@@ -114,12 +111,10 @@ notifications:
         mock_post.return_value.status_code = 200
         attack_info = {
             'dst_ip': '192.168.1.1',
-            'pps': 150000,
             'bps': 1500000000,
-            'fps': 15000,
+            'entropy': 0.85,
             'unique_sources': 2000,
-            'packets': 45000000,
-            'bytes': 450000000000
+            'attack_type': 'DDoS'
         }
         message = "Test message"
         self.notifier._send_slack("https://slack.com/test", message, attack_info)
@@ -139,10 +134,9 @@ clickhouse:
   database: flows
 detection:
   thresholds:
-    pps_threshold: 100000
-    bps_threshold: 1000000000
-    unique_sources_threshold: 1000
-    fps_threshold: 10000
+    total_external_bps_threshold: 1000000000
+    dst_bps_threshold: 1000000000
+    entropy_threshold: 0.8
             """)
             self.config_path = f.name
         self.config = ddos_detector.Config(self.config_path)
@@ -151,22 +145,40 @@ detection:
         """Clean up"""
         os.unlink(self.config_path)
     
+    def test_entropy_calculation(self):
+        """Test normalized entropy calculation"""
+        # Create a minimal detector instance just for entropy calculation
+        detector = ddos_detector.DDoSDetector.__new__(ddos_detector.DDoSDetector)
+        
+        # Test case 1: Evenly distributed sources (high entropy)
+        src_ips = ['10.0.0.1', '10.0.0.2', '10.0.0.3', '10.0.0.4']
+        src_bytes = [250, 250, 250, 250]
+        entropy = detector.calculate_normalized_entropy(src_ips, src_bytes)
+        self.assertGreater(entropy, 0.95)  # Should be close to 1.0
+        
+        # Test case 2: Single dominant source (low entropy)
+        src_ips = ['10.0.0.1', '10.0.0.2']
+        src_bytes = [950, 50]
+        entropy = detector.calculate_normalized_entropy(src_ips, src_bytes)
+        self.assertLess(entropy, 0.5)  # Should be low
+        
+        # Test case 3: Empty list
+        entropy = detector.calculate_normalized_entropy([], [])
+        self.assertEqual(entropy, 0.0)
+    
     @patch('ddos_detector.ClickHouseClient')
     @patch('ddos_detector.NotificationManager')
-    def test_detect_attacks_above_threshold(self, mock_notifier, mock_db):
-        """Test detection of traffic above threshold"""
+    def test_detect_ddos_attack(self, mock_notifier, mock_db):
+        """Test detection of DDoS attack (high entropy)"""
         # Mock database client
         mock_db_instance = Mock()
-        mock_db_instance.get_traffic_stats.return_value = [
+        mock_db_instance.get_total_external_traffic.return_value = 2000000000  # 2 Gbps
+        mock_db_instance.get_dst_traffic_stats.return_value = [
             {
                 'dst_ip': '192.168.1.1',
-                'pps': 150000,  # Above threshold
-                'bps': 500000000,
-                'fps': 5000,
-                'unique_sources': 500,
-                'packets': 45000000,
-                'bytes': 150000000000,
-                'flows': 15000
+                'bps': 1500000000,  # 1.5 Gbps
+                'src_ips': ['10.0.0.1', '10.0.0.2', '10.0.0.3', '10.0.0.4'],
+                'src_bytes': [375000000, 375000000, 375000000, 375000000]  # Evenly distributed
             }
         ]
         mock_db.return_value = mock_db_instance
@@ -181,9 +193,42 @@ detection:
         # Detect attacks
         attacks = detector.detect_attacks()
         
-        # Verify attack detected
+        # Verify DDoS attack detected (entropy should be high)
         self.assertEqual(len(attacks), 1)
         self.assertEqual(attacks[0]['dst_ip'], '192.168.1.1')
+        self.assertEqual(attacks[0]['attack_type'], 'DDoS')
+    
+    @patch('ddos_detector.ClickHouseClient')
+    @patch('ddos_detector.NotificationManager')
+    def test_detect_dos_attack(self, mock_notifier, mock_db):
+        """Test detection of DoS attack (low entropy)"""
+        # Mock database client
+        mock_db_instance = Mock()
+        mock_db_instance.get_total_external_traffic.return_value = 2000000000  # 2 Gbps
+        mock_db_instance.get_dst_traffic_stats.return_value = [
+            {
+                'dst_ip': '192.168.1.1',
+                'bps': 1500000000,  # 1.5 Gbps
+                'src_ips': ['10.0.0.1', '10.0.0.2'],
+                'src_bytes': [1400000000, 100000000]  # Heavily skewed to one source
+            }
+        ]
+        mock_db.return_value = mock_db_instance
+        
+        # Mock notifier
+        mock_notifier_instance = Mock()
+        mock_notifier.return_value = mock_notifier_instance
+        
+        # Create detector
+        detector = ddos_detector.DDoSDetector(self.config)
+        
+        # Detect attacks
+        attacks = detector.detect_attacks()
+        
+        # Verify DoS attack detected (entropy should be low)
+        self.assertEqual(len(attacks), 1)
+        self.assertEqual(attacks[0]['dst_ip'], '192.168.1.1')
+        self.assertEqual(attacks[0]['attack_type'], 'DoS')
     
     @patch('ddos_detector.ClickHouseClient')
     @patch('ddos_detector.NotificationManager')
@@ -191,18 +236,8 @@ detection:
         """Test no detection when below threshold"""
         # Mock database client
         mock_db_instance = Mock()
-        mock_db_instance.get_traffic_stats.return_value = [
-            {
-                'dst_ip': '192.168.1.1',
-                'pps': 50000,  # Below threshold
-                'bps': 500000000,
-                'fps': 5000,
-                'unique_sources': 500,
-                'packets': 15000000,
-                'bytes': 150000000000,
-                'flows': 15000
-            }
-        ]
+        mock_db_instance.get_total_external_traffic.return_value = 500000000  # 0.5 Gbps - below threshold
+        mock_db_instance.get_dst_traffic_stats.return_value = []
         mock_db.return_value = mock_db_instance
         
         # Mock notifier

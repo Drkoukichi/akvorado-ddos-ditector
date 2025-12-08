@@ -8,6 +8,7 @@ import os
 import sys
 import time
 import logging
+import math
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import yaml
@@ -48,10 +49,9 @@ class Config:
         config['detection']['time_window'] = int(os.getenv('TIME_WINDOW', config.get('detection', {}).get('time_window', 300)))
         
         config['detection'].setdefault('thresholds', {})
-        config['detection']['thresholds']['pps_threshold'] = int(os.getenv('PPS_THRESHOLD', config.get('detection', {}).get('thresholds', {}).get('pps_threshold', 100000)))
-        config['detection']['thresholds']['bps_threshold'] = int(os.getenv('BPS_THRESHOLD', config.get('detection', {}).get('thresholds', {}).get('bps_threshold', 1000000000)))
-        config['detection']['thresholds']['unique_sources_threshold'] = int(os.getenv('UNIQUE_SOURCES_THRESHOLD', config.get('detection', {}).get('thresholds', {}).get('unique_sources_threshold', 1000)))
-        config['detection']['thresholds']['fps_threshold'] = int(os.getenv('FPS_THRESHOLD', config.get('detection', {}).get('thresholds', {}).get('fps_threshold', 10000)))
+        config['detection']['thresholds']['total_external_bps_threshold'] = int(os.getenv('TOTAL_EXTERNAL_BPS_THRESHOLD', config.get('detection', {}).get('thresholds', {}).get('total_external_bps_threshold', 1000000000)))
+        config['detection']['thresholds']['dst_bps_threshold'] = int(os.getenv('DST_BPS_THRESHOLD', config.get('detection', {}).get('thresholds', {}).get('dst_bps_threshold', 1000000000)))
+        config['detection']['thresholds']['entropy_threshold'] = float(os.getenv('ENTROPY_THRESHOLD', config.get('detection', {}).get('thresholds', {}).get('entropy_threshold', 0.8)))
         
         config.setdefault('notifications', {})
         config['notifications']['discord_webhook'] = os.getenv('DISCORD_WEBHOOK', config.get('notifications', {}).get('discord_webhook', ''))
@@ -100,9 +100,42 @@ class ClickHouseClient:
             logging.error(f"Failed to connect to ClickHouse: {e}")
             raise
     
-    def get_traffic_stats(self, time_window: int) -> List[Dict]:
+    def get_total_external_traffic(self, time_window: int) -> float:
         """
-        Get aggregated traffic statistics for the specified time window
+        Get total traffic with InIfBoundary = external
+        
+        Args:
+            time_window: Time window in seconds
+            
+        Returns:
+            Total bytes per second for external traffic
+        """
+        try:
+            end_time = datetime.now()
+            start_time = end_time - timedelta(seconds=time_window)
+            
+            query = f"""
+            SELECT
+                sum(Bytes) / {time_window} as bps
+            FROM flows
+            WHERE TimeReceived >= toDateTime('{start_time.strftime('%Y-%m-%d %H:%M:%S')}')
+              AND TimeReceived <= toDateTime('{end_time.strftime('%Y-%m-%d %H:%M:%S')}')
+              AND InIfBoundary = 'external'
+            """
+            
+            result = self.client.query(query)
+            
+            if result.result_rows and len(result.result_rows) > 0:
+                return float(result.result_rows[0][0] or 0)
+            return 0.0
+            
+        except Exception as e:
+            logging.error(f"Failed to query total external traffic: {e}")
+            return 0.0
+    
+    def get_dst_traffic_stats(self, time_window: int) -> List[Dict]:
+        """
+        Get aggregated traffic statistics per destination IP for external traffic
         
         Args:
             time_window: Time window in seconds
@@ -111,44 +144,40 @@ class ClickHouseClient:
             List of dictionaries with traffic statistics per destination
         """
         try:
-            # Calculate time range
             end_time = datetime.now()
             start_time = end_time - timedelta(seconds=time_window)
             
-            # Query to get aggregated traffic stats
-            # This query assumes Akvorado's standard schema
-            # Adjust column names based on your actual schema
             query = f"""
             SELECT
                 DstAddr as dst_ip,
-                count() as flows,
-                sum(Packets) as packets,
-                sum(Bytes) as bytes,
-                uniq(SrcAddr) as unique_sources,
-                sum(Packets) / {time_window} as pps,
                 sum(Bytes) / {time_window} as bps,
-                count() / {time_window} as fps
+                groupArray(SrcAddr) as src_ips,
+                groupArray(Bytes) as src_bytes
             FROM flows
             WHERE TimeReceived >= toDateTime('{start_time.strftime('%Y-%m-%d %H:%M:%S')}')
               AND TimeReceived <= toDateTime('{end_time.strftime('%Y-%m-%d %H:%M:%S')}')
+              AND InIfBoundary = 'external'
             GROUP BY DstAddr
-            HAVING pps > 1000 OR unique_sources > 100
-            ORDER BY pps DESC
+            HAVING bps > 1000000
+            ORDER BY bps DESC
             LIMIT 100
             """
             
             result = self.client.query(query)
             
-            # Convert result to list of dictionaries
-            columns = ['dst_ip', 'flows', 'packets', 'bytes', 'unique_sources', 'pps', 'bps', 'fps']
             stats = []
             for row in result.result_rows:
-                stats.append(dict(zip(columns, row)))
+                stats.append({
+                    'dst_ip': row[0],
+                    'bps': float(row[1]),
+                    'src_ips': row[2],
+                    'src_bytes': row[3]
+                })
             
             return stats
             
         except Exception as e:
-            logging.error(f"Failed to query traffic stats: {e}")
+            logging.error(f"Failed to query destination traffic stats: {e}")
             return []
 
 
@@ -195,32 +224,36 @@ class NotificationManager:
     
     def _format_message(self, attack_info: Dict) -> str:
         """Format alert message"""
-        return (
-            f"🚨 **DDoS Attack Detected!** 🚨\n\n"
+        attack_type = attack_info.get('attack_type', 'DDoS')
+        emoji = "🚨" if attack_type == "DDoS" else "⚠️"
+        
+        message = (
+            f"{emoji} **{attack_type} Attack Detected!** {emoji}\n\n"
             f"**Target IP:** {attack_info['dst_ip']}\n"
-            f"**Packets/sec:** {attack_info['pps']:,.0f}\n"
             f"**Bytes/sec:** {attack_info['bps']:,.0f} ({attack_info['bps']/1000000000:.2f} Gbps)\n"
-            f"**Flows/sec:** {attack_info['fps']:,.0f}\n"
-            f"**Unique Sources:** {attack_info['unique_sources']:,}\n"
-            f"**Total Packets:** {attack_info['packets']:,}\n"
-            f"**Total Bytes:** {attack_info['bytes']:,}\n"
+            f"**Entropy:** {attack_info.get('entropy', 0):.4f}\n"
+            f"**Unique Sources:** {attack_info.get('unique_sources', 0):,}\n"
             f"**Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         )
+        
+        return message
     
     def _send_discord(self, webhook_url: str, message: str, attack_info: Dict):
         """Send notification to Discord"""
         try:
-            # Determine color based on severity
-            if attack_info['pps'] > 500000 or attack_info['bps'] > 5000000000:
-                color = 0xFF0000  # Red - Critical
-            elif attack_info['pps'] > 200000 or attack_info['bps'] > 2000000000:
-                color = 0xFF6600  # Orange - High
+            attack_type = attack_info.get('attack_type', 'DDoS')
+            
+            # Determine color based on attack type and severity
+            if attack_type == "DDoS":
+                color = 0xFF0000  # Red - DDoS
             else:
-                color = 0xFFCC00  # Yellow - Medium
+                color = 0xFF6600  # Orange - DoS
+            
+            emoji = "🚨" if attack_type == "DDoS" else "⚠️"
             
             payload = {
                 "embeds": [{
-                    "title": "🚨 DDoS Attack Detected",
+                    "title": f"{emoji} {attack_type} Attack Detected",
                     "description": message,
                     "color": color,
                     "timestamp": datetime.now().isoformat(),
@@ -232,7 +265,7 @@ class NotificationManager:
             
             response = requests.post(webhook_url, json=payload, timeout=10)
             response.raise_for_status()
-            logging.info(f"Discord notification sent for {attack_info['dst_ip']}")
+            logging.info(f"Discord notification sent for {attack_info['dst_ip']} ({attack_type})")
             
         except Exception as e:
             logging.error(f"Failed to send Discord notification: {e}")
@@ -240,18 +273,20 @@ class NotificationManager:
     def _send_slack(self, webhook_url: str, message: str, attack_info: Dict):
         """Send notification to Slack"""
         try:
-            # Determine color based on severity
-            if attack_info['pps'] > 500000 or attack_info['bps'] > 5000000000:
+            attack_type = attack_info.get('attack_type', 'DDoS')
+            
+            # Determine color based on attack type
+            if attack_type == "DDoS":
                 color = "danger"  # Red
-            elif attack_info['pps'] > 200000 or attack_info['bps'] > 2000000000:
-                color = "warning"  # Orange
             else:
-                color = "#FFCC00"  # Yellow
+                color = "warning"  # Orange
+            
+            emoji = "🚨" if attack_type == "DDoS" else "⚠️"
             
             payload = {
                 "attachments": [{
                     "color": color,
-                    "title": "🚨 DDoS Attack Detected",
+                    "title": f"{emoji} {attack_type} Attack Detected",
                     "text": message,
                     "footer": "Akvorado DDoS Detector",
                     "ts": int(datetime.now().timestamp())
@@ -260,7 +295,7 @@ class NotificationManager:
             
             response = requests.post(webhook_url, json=payload, timeout=10)
             response.raise_for_status()
-            logging.info(f"Slack notification sent for {attack_info['dst_ip']}")
+            logging.info(f"Slack notification sent for {attack_info['dst_ip']} ({attack_type})")
             
         except Exception as e:
             logging.error(f"Failed to send Slack notification: {e}")
@@ -274,23 +309,97 @@ class DDoSDetector:
         self.db_client = ClickHouseClient(config)
         self.notifier = NotificationManager(config)
     
-    def detect_attacks(self) -> List[Dict]:
-        """Detect potential DDoS attacks"""
-        time_window = self.config.get('detection', 'time_window')
-        stats = self.db_client.get_traffic_stats(time_window)
+    def calculate_normalized_entropy(self, src_ips: List, src_bytes: List) -> float:
+        """
+        Calculate normalized entropy of source IPs based on their traffic distribution
         
-        attacks = []
+        Args:
+            src_ips: List of source IP addresses
+            src_bytes: List of bytes for each source IP
+            
+        Returns:
+            Normalized entropy value between 0 and 1
+        """
+        if not src_ips or not src_bytes or len(src_ips) == 0:
+            return 0.0
+        
+        # Calculate total bytes
+        total_bytes = sum(src_bytes)
+        if total_bytes == 0:
+            return 0.0
+        
+        # Calculate entropy
+        entropy = 0.0
+        for bytes_val in src_bytes:
+            if bytes_val > 0:
+                p = bytes_val / total_bytes
+                entropy -= p * math.log2(p)
+        
+        # Normalize entropy (max entropy is log2(n) where n is number of sources)
+        n = len(src_ips)
+        if n <= 1:
+            return 0.0
+        
+        max_entropy = math.log2(n)
+        normalized_entropy = entropy / max_entropy if max_entropy > 0 else 0.0
+        
+        return normalized_entropy
+    
+    def detect_attacks(self) -> List[Dict]:
+        """
+        Detect potential DoS/DDoS attacks using the new logic:
+        1. Check if total external traffic exceeds 1 Gbps
+        2. If yes, check each destination IP for traffic > 1 Gbps
+        3. For each destination > 1 Gbps, calculate entropy to determine DoS vs DDoS
+        """
+        time_window = self.config.get('detection', 'time_window')
         thresholds = self.config.get('detection', 'thresholds')
         
-        for stat in stats:
-            # Check if any threshold is exceeded
-            if (stat['pps'] > thresholds.get('pps_threshold', float('inf')) or
-                stat['bps'] > thresholds.get('bps_threshold', float('inf')) or
-                stat['unique_sources'] > thresholds.get('unique_sources_threshold', float('inf')) or
-                stat['fps'] > thresholds.get('fps_threshold', float('inf'))):
+        # Step 1: Check total external traffic
+        total_external_bps = self.db_client.get_total_external_traffic(time_window)
+        total_threshold = thresholds.get('total_external_bps_threshold', 1000000000)
+        
+        logging.debug(f"Total external traffic: {total_external_bps/1000000000:.2f} Gbps (threshold: {total_threshold/1000000000:.2f} Gbps)")
+        
+        if total_external_bps <= total_threshold:
+            logging.debug("Total external traffic below threshold, no further checks needed")
+            return []
+        
+        logging.info(f"Total external traffic exceeds threshold: {total_external_bps/1000000000:.2f} Gbps")
+        
+        # Step 2: Check per-destination traffic
+        dst_stats = self.db_client.get_dst_traffic_stats(time_window)
+        dst_threshold = thresholds.get('dst_bps_threshold', 1000000000)
+        entropy_threshold = thresholds.get('entropy_threshold', 0.8)
+        
+        attacks = []
+        
+        for stat in dst_stats:
+            if stat['bps'] > dst_threshold:
+                # Step 3: Calculate entropy to determine DoS vs DDoS
+                entropy = self.calculate_normalized_entropy(stat['src_ips'], stat['src_bytes'])
                 
-                attacks.append(stat)
-                logging.warning(f"DDoS attack detected: {stat['dst_ip']} - {stat['pps']:.0f} pps, {stat['bps']/1000000000:.2f} Gbps")
+                # Determine attack type based on entropy
+                if entropy > entropy_threshold:
+                    attack_type = "DDoS"
+                else:
+                    attack_type = "DoS"
+                
+                attack_info = {
+                    'dst_ip': stat['dst_ip'],
+                    'bps': stat['bps'],
+                    'entropy': entropy,
+                    'unique_sources': len(set(stat['src_ips'])),
+                    'attack_type': attack_type
+                }
+                
+                attacks.append(attack_info)
+                logging.warning(
+                    f"{attack_type} attack detected: {stat['dst_ip']} - "
+                    f"{stat['bps']/1000000000:.2f} Gbps, "
+                    f"entropy: {entropy:.4f}, "
+                    f"sources: {len(set(stat['src_ips']))}"
+                )
         
         return attacks
     
