@@ -147,23 +147,20 @@ detection:
     
     def test_entropy_calculation(self):
         """Test normalized entropy calculation"""
-        # Create a minimal detector instance just for entropy calculation
-        detector = ddos_detector.DDoSDetector.__new__(ddos_detector.DDoSDetector)
-        
         # Test case 1: Evenly distributed sources (high entropy)
         src_ips = ['10.0.0.1', '10.0.0.2', '10.0.0.3', '10.0.0.4']
         src_bytes = [250, 250, 250, 250]
-        entropy = detector.calculate_normalized_entropy(src_ips, src_bytes)
+        entropy = ddos_detector.DDoSDetector.calculate_normalized_entropy(src_ips, src_bytes)
         self.assertGreater(entropy, 0.95)  # Should be close to 1.0
         
         # Test case 2: Single dominant source (low entropy)
         src_ips = ['10.0.0.1', '10.0.0.2']
         src_bytes = [950, 50]
-        entropy = detector.calculate_normalized_entropy(src_ips, src_bytes)
+        entropy = ddos_detector.DDoSDetector.calculate_normalized_entropy(src_ips, src_bytes)
         self.assertLess(entropy, 0.5)  # Should be low
         
         # Test case 3: Empty list
-        entropy = detector.calculate_normalized_entropy([], [])
+        entropy = ddos_detector.DDoSDetector.calculate_normalized_entropy([], [])
         self.assertEqual(entropy, 0.0)
     
     @patch('ddos_detector.ClickHouseClient')
@@ -178,7 +175,8 @@ detection:
                 'dst_ip': '192.168.1.1',
                 'bps': 1500000000,  # 1.5 Gbps
                 'src_ips': ['10.0.0.1', '10.0.0.2', '10.0.0.3', '10.0.0.4'],
-                'src_bytes': [375000000, 375000000, 375000000, 375000000]  # Evenly distributed
+                'src_bytes': [375000000, 375000000, 375000000, 375000000],  # Evenly distributed
+                'unique_sources': 4
             }
         ]
         mock_db.return_value = mock_db_instance
@@ -210,7 +208,8 @@ detection:
                 'dst_ip': '192.168.1.1',
                 'bps': 1500000000,  # 1.5 Gbps
                 'src_ips': ['10.0.0.1', '10.0.0.2'],
-                'src_bytes': [1400000000, 100000000]  # Heavily skewed to one source
+                'src_bytes': [1400000000, 100000000],  # Heavily skewed to one source
+                'unique_sources': 2
             }
         ]
         mock_db.return_value = mock_db_instance

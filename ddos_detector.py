@@ -152,7 +152,8 @@ class ClickHouseClient:
                 DstAddr as dst_ip,
                 sum(Bytes) / {time_window} as bps,
                 groupArray(SrcAddr) as src_ips,
-                groupArray(Bytes) as src_bytes
+                groupArray(Bytes) as src_bytes,
+                uniq(SrcAddr) as unique_sources
             FROM flows
             WHERE TimeReceived >= toDateTime('{start_time.strftime('%Y-%m-%d %H:%M:%S')}')
               AND TimeReceived <= toDateTime('{end_time.strftime('%Y-%m-%d %H:%M:%S')}')
@@ -171,7 +172,8 @@ class ClickHouseClient:
                     'dst_ip': row[0],
                     'bps': float(row[1]),
                     'src_ips': row[2],
-                    'src_bytes': row[3]
+                    'src_bytes': row[3],
+                    'unique_sources': int(row[4])
                 })
             
             return stats
@@ -309,7 +311,8 @@ class DDoSDetector:
         self.db_client = ClickHouseClient(config)
         self.notifier = NotificationManager(config)
     
-    def calculate_normalized_entropy(self, src_ips: List, src_bytes: List) -> float:
+    @staticmethod
+    def calculate_normalized_entropy(src_ips: List, src_bytes: List) -> float:
         """
         Calculate normalized entropy of source IPs based on their traffic distribution
         
@@ -320,7 +323,7 @@ class DDoSDetector:
         Returns:
             Normalized entropy value between 0 and 1
         """
-        if not src_ips or not src_bytes or len(src_ips) == 0:
+        if not src_ips or not src_bytes:
             return 0.0
         
         # Calculate total bytes
@@ -389,7 +392,7 @@ class DDoSDetector:
                     'dst_ip': stat['dst_ip'],
                     'bps': stat['bps'],
                     'entropy': entropy,
-                    'unique_sources': len(set(stat['src_ips'])),
+                    'unique_sources': stat['unique_sources'],
                     'attack_type': attack_type
                 }
                 
@@ -398,7 +401,7 @@ class DDoSDetector:
                     f"{attack_type} attack detected: {stat['dst_ip']} - "
                     f"{stat['bps']/1000000000:.2f} Gbps, "
                     f"entropy: {entropy:.4f}, "
-                    f"sources: {len(set(stat['src_ips']))}"
+                    f"sources: {stat['unique_sources']}"
                 )
         
         return attacks
