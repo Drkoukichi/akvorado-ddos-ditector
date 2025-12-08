@@ -62,6 +62,11 @@ class Config:
         config['logging']['level'] = os.getenv('LOG_LEVEL', config.get('logging', {}).get('level', 'INFO'))
         config['logging']['file'] = os.getenv('LOG_FILE', config.get('logging', {}).get('file', 'ddos_detector.log'))
         
+        config.setdefault('abuseipdb', {})
+        config['abuseipdb']['api_key'] = os.getenv('ABUSEIPDB_API_KEY', config.get('abuseipdb', {}).get('api_key', ''))
+        config['abuseipdb']['enabled'] = bool(config['abuseipdb']['api_key'])
+        config['abuseipdb']['max_age_days'] = int(os.getenv('ABUSEIPDB_MAX_AGE_DAYS', config.get('abuseipdb', {}).get('max_age_days', 90)))
+        
         return config
     
     def get(self, *keys, default=None):
@@ -183,6 +188,81 @@ class ClickHouseClient:
             return []
 
 
+class AbuseIPDBClient:
+    """Client for AbuseIPDB API"""
+    
+    def __init__(self, config: Config):
+        self.config = config
+        self.api_key = config.get('abuseipdb', 'api_key')
+        self.enabled = config.get('abuseipdb', 'enabled', default=False)
+        self.max_age_days = config.get('abuseipdb', 'max_age_days', default=90)
+        self.base_url = 'https://api.abuseipdb.com/api/v2'
+    
+    def check_ip(self, ip_address: str) -> Optional[Dict]:
+        """Check if an IP address has been reported to AbuseIPDB
+        
+        Args:
+            ip_address: IP address to check
+            
+        Returns:
+            Dictionary with abuse information or None if not available
+        """
+        if not self.enabled:
+            logging.debug("AbuseIPDB API is disabled")
+            return None
+        
+        try:
+            headers = {
+                'Key': self.api_key,
+                'Accept': 'application/json'
+            }
+            
+            params = {
+                'ipAddress': ip_address,
+                'maxAgeInDays': self.max_age_days,
+                'verbose': ''
+            }
+            
+            response = requests.get(
+                f'{self.base_url}/check',
+                headers=headers,
+                params=params,
+                timeout=10
+            )
+            
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'data' in data:
+                ip_data = data['data']
+                result = {
+                    'ip_address': ip_data.get('ipAddress'),
+                    'abuse_confidence_score': ip_data.get('abuseConfidenceScore', 0),
+                    'total_reports': ip_data.get('totalReports', 0),
+                    'is_reported': ip_data.get('totalReports', 0) > 0,
+                    'country_code': ip_data.get('countryCode', 'Unknown'),
+                    'usage_type': ip_data.get('usageType', 'Unknown'),
+                    'isp': ip_data.get('isp', 'Unknown')
+                }
+                
+                logging.info(
+                    f"AbuseIPDB check for {ip_address}: "
+                    f"reports={result['total_reports']}, "
+                    f"score={result['abuse_confidence_score']}"
+                )
+                
+                return result
+            
+            return None
+            
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Failed to check IP {ip_address} with AbuseIPDB: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"Unexpected error checking IP {ip_address}: {e}")
+            return None
+
+
 class NotificationManager:
     """Manage notifications to Discord and Slack"""
     
@@ -237,6 +317,20 @@ class NotificationManager:
             f"**Unique Sources:** {attack_info.get('unique_sources', 0):,}\n"
             f"**Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         )
+        
+        # Add AbuseIPDB information if available
+        abuse_info = attack_info.get('abuse_info')
+        if abuse_info:
+            message += (
+                f"\n**🔍 AbuseIPDB Check:**\n"
+                f"**Reported IP Found:** {abuse_info.get('ip_address')}\n"
+                f"**Total Reports:** {abuse_info.get('total_reports', 0)}\n"
+                f"**Abuse Score:** {abuse_info.get('abuse_confidence_score', 0)}%\n"
+                f"**Country:** {abuse_info.get('country_code', 'Unknown')}\n"
+                f"**ISP:** {abuse_info.get('isp', 'Unknown')}\n"
+            )
+        elif attack_info.get('entropy_triggered'):
+            message += f"\n**⚠️ Alert Reason:** High source IP entropy detected\n"
         
         return message
     
@@ -310,6 +404,7 @@ class DDoSDetector:
         self.config = config
         self.db_client = ClickHouseClient(config)
         self.notifier = NotificationManager(config)
+        self.abuseipdb_client = AbuseIPDBClient(config)
     
     @staticmethod
     def calculate_normalized_entropy(src_ips: List, src_bytes: List) -> float:
@@ -353,7 +448,9 @@ class DDoSDetector:
         Detect potential DoS/DDoS attacks using the new logic:
         1. Check if total external traffic exceeds 1 Gbps
         2. If yes, check each destination IP for traffic > 1 Gbps
-        3. For each destination > 1 Gbps, calculate entropy to determine DoS vs DDoS
+        3. For each destination > 1 Gbps, check source IPs with AbuseIPDB
+        4. Alert if: IP is reported in AbuseIPDB OR entropy is high
+        5. Stop API calls after first reported IP is found (to save API quota)
         """
         time_window = self.config.get('detection', 'time_window')
         thresholds = self.config.get('detection', 'thresholds')
@@ -376,10 +473,11 @@ class DDoSDetector:
         entropy_threshold = thresholds.get('entropy_threshold', 0.8)
         
         attacks = []
+        api_quota_reached = False  # Flag to stop API calls after first reported IP
         
         for stat in dst_stats:
             if stat['bps'] > dst_threshold:
-                # Step 3: Calculate entropy to determine DoS vs DDoS
+                # Step 3: Calculate entropy
                 entropy = self.calculate_normalized_entropy(stat['src_ips'], stat['src_bytes'])
                 
                 # Determine attack type based on entropy
@@ -388,21 +486,61 @@ class DDoSDetector:
                 else:
                     attack_type = "DoS"
                 
-                attack_info = {
-                    'dst_ip': stat['dst_ip'],
-                    'bps': stat['bps'],
-                    'entropy': entropy,
-                    'unique_sources': stat['unique_sources'],
-                    'attack_type': attack_type
-                }
+                # Step 4: Check source IPs with AbuseIPDB (if not already found a reported IP)
+                should_alert = False
+                abuse_info = None
+                entropy_triggered = False
                 
-                attacks.append(attack_info)
-                logging.warning(
-                    f"{attack_type} attack detected: {stat['dst_ip']} - "
-                    f"{stat['bps']/1000000000:.2f} Gbps, "
-                    f"entropy: {entropy:.4f}, "
-                    f"sources: {stat['unique_sources']}"
-                )
+                if not api_quota_reached and self.abuseipdb_client.enabled:
+                    # Check source IPs against AbuseIPDB
+                    for src_ip in stat['src_ips']:
+                        abuse_result = self.abuseipdb_client.check_ip(src_ip)
+                        
+                        if abuse_result and abuse_result.get('is_reported'):
+                            # Found a reported IP - trigger alert and stop API calls
+                            should_alert = True
+                            abuse_info = abuse_result
+                            api_quota_reached = True
+                            logging.warning(
+                                f"Reported IP found: {src_ip} "
+                                f"(reports: {abuse_result.get('total_reports')}, "
+                                f"score: {abuse_result.get('abuse_confidence_score')}%)"
+                            )
+                            break
+                    
+                    # If no reported IP found but entropy is high, still alert
+                    if not should_alert and entropy > entropy_threshold:
+                        should_alert = True
+                        entropy_triggered = True
+                        logging.warning(
+                            f"High entropy detected for {stat['dst_ip']}: {entropy:.4f}"
+                        )
+                else:
+                    # AbuseIPDB disabled or quota reached - check entropy only
+                    if entropy > entropy_threshold:
+                        should_alert = True
+                        entropy_triggered = True
+                
+                # Step 5: Add to attacks list if alert criteria met
+                if should_alert:
+                    attack_info = {
+                        'dst_ip': stat['dst_ip'],
+                        'bps': stat['bps'],
+                        'entropy': entropy,
+                        'unique_sources': stat['unique_sources'],
+                        'attack_type': attack_type,
+                        'abuse_info': abuse_info,
+                        'entropy_triggered': entropy_triggered
+                    }
+                    
+                    attacks.append(attack_info)
+                    logging.warning(
+                        f"{attack_type} attack detected: {stat['dst_ip']} - "
+                        f"{stat['bps']/1000000000:.2f} Gbps, "
+                        f"entropy: {entropy:.4f}, "
+                        f"sources: {stat['unique_sources']}, "
+                        f"abuse_reported: {abuse_info is not None}"
+                    )
         
         return attacks
     

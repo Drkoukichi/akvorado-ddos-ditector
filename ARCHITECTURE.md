@@ -30,9 +30,16 @@ The Akvorado DDoS Detector is a Python-based monitoring system that analyzes net
 │  │  │ - Query aggregated traffic stats       │ │  │
 │  │  └────────────────────────────────────────┘ │  │
 │  │  ┌────────────────────────────────────────┐ │  │
+│  │  │ AbuseIPDB Client                       │ │  │
+│  │  │ - Check IPs against malicious DB       │ │  │
+│  │  │ - Get abuse reports and scores         │ │  │
+│  │  │ - Manage API quota                     │ │  │
+│  │  └────────────────────────────────────────┘ │  │
+│  │  ┌────────────────────────────────────────┐ │  │
 │  │  │ DDoS Detector                          │ │  │
 │  │  │ - Analyze traffic patterns             │ │  │
-│  │  │ - Apply detection thresholds           │ │  │
+│  │  │ - Calculate entropy                    │ │  │
+│  │  │ - Validate with AbuseIPDB              │ │  │
 │  │  │ - Identify attacks                     │ │  │
 │  │  └────────────────────────────────────────┘ │  │
 │  │  ┌────────────────────────────────────────┐ │  │
@@ -70,48 +77,119 @@ The Akvorado DDoS Detector is a Python-based monitoring system that analyzes net
 2. YAML configuration file
 3. Built-in defaults (lowest)
 
+**Key Configuration Sections:**
+- ClickHouse connection settings
+- Detection thresholds and time windows
+- AbuseIPDB API credentials
+- Notification channels and cooldowns
+- Logging configuration
+
 ### 2. ClickHouse Client (`ClickHouseClient`)
 
 **Responsibility:** Interface with Akvorado's ClickHouse database
 
 **Key Methods:**
 - `_connect()`: Establishes database connection
-- `get_traffic_stats(time_window)`: Queries aggregated flow data
+- `get_total_external_traffic(time_window)`: Queries total external traffic
+- `get_dst_traffic_stats(time_window)`: Queries per-destination traffic with source IP distribution
 
 **Query Design:**
+- Filters for external boundary traffic (`InIfBoundary = 'external'`)
 - Aggregates traffic by destination IP
-- Calculates rates (PPS, BPS, FPS)
+- Calculates bytes per second (BPS)
+- Collects source IP lists and their traffic distribution
 - Counts unique source IPs
-- Filters for significant traffic
+- Filters for significant traffic (> 1 Mbps)
 - Time-windowed analysis
 
-### 3. DDoS Detector (`DDoSDetector`)
+### 3. AbuseIPDB Client (`AbuseIPDBClient`)
+
+**Responsibility:** Validate source IPs against AbuseIPDB malicious IP database
+
+**Key Methods:**
+- `check_ip(ip_address)`: Check if an IP has been reported for malicious activity
+
+**Features:**
+- Optional integration (enabled only with API key)
+- Returns abuse confidence score (0-100%)
+- Provides report count and ISP information
+- Smart quota management (stops after first reported IP)
+- Error handling for API failures
+
+**Response Data:**
+- IP address
+- Abuse confidence score
+- Total number of reports
+- Country code
+- ISP name
+- Usage type (Data Center, ISP, etc.)
+
+### 4. DDoS Detector (`DDoSDetector`)
 
 **Responsibility:** Analyze traffic and detect attacks
 
 **Detection Metrics:**
-- **PPS (Packets Per Second):** High packet rate attacks
-- **BPS (Bytes Per Second):** Volumetric attacks
-- **FPS (Flows Per Second):** Connection flood attacks
-- **Unique Sources:** Distributed attacks
+- **BPS (Bytes Per Second):** Volumetric attacks (primary metric)
+- **Normalized Entropy:** Distribution of traffic across source IPs
+- **Unique Sources:** Number of distinct attacking sources
+- **AbuseIPDB Reports:** Known malicious IP validation
 
 **Algorithm:**
-1. Query traffic statistics from database
-2. For each destination IP:
+1. Check total external traffic threshold (1 Gbps default)
+   - If below threshold, skip detailed analysis (no attack)
+2. Query per-destination traffic statistics from database
+3. For each destination IP exceeding threshold (1 Gbps default):
+   a. Calculate normalized entropy of source IP distribution
+   b. Classify attack type:
+      - High entropy (> 0.8) → DDoS (distributed)
+      - Low entropy (≤ 0.8) → DoS (concentrated)
+   c. If AbuseIPDB enabled, check source IPs:
+      - Query API for each source IP
+      - Stop after first reported IP found (quota saving)
+   d. Trigger alert if:
+      - Source IP found in AbuseIPDB with reports, OR
+      - Entropy exceeds threshold (0.8)
+4. Return list of detected attacks with metadata
+
+**Entropy Calculation:**
+```python
+entropy = -Σ(p_i * log2(p_i))  # Shannon entropy
+normalized_entropy = entropy / log2(n)  # Normalize to [0, 1]
+```
+Where:
+- p_i = proportion of traffic from source i
+- n = number of unique sources
+
+**API Quota Management:**
+- Single flag tracks if reported IP found
+- Once set, no more API calls made
+- Saves API quota for future detections
+- Allows multiple destinations to be checked efficiently
    - Compare metrics against thresholds
    - If any threshold exceeded → Flag as attack
 3. Return list of detected attacks
 
 **Threshold Logic:**
-Attack detected if ANY of these conditions are met:
+Two-stage detection process:
+
+**Stage 1: Traffic Volume Check**
 ```python
-pps > pps_threshold OR
-bps > bps_threshold OR
-unique_sources > unique_sources_threshold OR
-fps > fps_threshold
+total_external_bps > total_threshold (1 Gbps) AND
+destination_bps > dst_threshold (1 Gbps)
 ```
 
-### 4. Notification Manager (`NotificationManager`)
+**Stage 2: Alert Trigger (if Stage 1 passes)**
+```python
+(source_ip in AbuseIPDB with reports) OR
+(normalized_entropy > entropy_threshold)
+```
+
+This approach:
+- Reduces false positives from legitimate high traffic
+- Combines reputation-based and behavior-based detection
+- Saves API quota by using entropy as alternative signal
+
+### 5. Notification Manager (`NotificationManager`)
 
 **Responsibility:** Send alerts to notification channels
 
@@ -123,7 +201,16 @@ fps > fps_threshold
 
 **Message Structure:**
 - Target IP address
-- Traffic metrics
+- Traffic metrics (BPS, Gbps)
+- Normalized entropy value
+- Unique source count
+- Attack type (DoS/DDoS)
+- AbuseIPDB information (if available):
+  - Reported IP address
+  - Total reports
+  - Abuse confidence score
+  - Country and ISP
+- Alert reason (AbuseIPDB or entropy)
 - Timestamp
 - Visual severity indicator (colors)
 
@@ -146,10 +233,34 @@ fps > fps_threshold
 
 3. **Attack Detection:**
    ```python
+   total_traffic = get_total_external_traffic()
+   if total_traffic <= threshold:
+       return []  # No attack
+   
+   api_quota_reached = False
    for each destination_ip in traffic_stats:
-       if exceeds_any_threshold(destination_ip):
-           classify_as_attack()
-           notify_channels()
+       if destination_bps > threshold:
+           entropy = calculate_entropy(src_ips, src_bytes)
+           attack_type = 'DDoS' if entropy > 0.8 else 'DoS'
+           
+           should_alert = False
+           abuse_info = None
+           
+           # Check AbuseIPDB if enabled and quota not reached
+           if abuseipdb_enabled and not api_quota_reached:
+               for src_ip in source_ips:
+                   abuse_info = check_abuseipdb(src_ip)
+                   if abuse_info and abuse_info.is_reported:
+                       should_alert = True
+                       api_quota_reached = True  # Stop further API calls
+                       break
+           
+           # Check entropy if no reported IP found
+           if not should_alert and entropy > entropy_threshold:
+               should_alert = True
+           
+           if should_alert:
+               notify_channels(attack_info)
    ```
 
 4. **Notification Flow:**
@@ -167,17 +278,44 @@ Analyzing traffic over a time window (default: 5 minutes) provides:
 - Reduces false positives
 - Provides context for analysis
 
-### 2. Why Multiple Metrics?
+### 2. Why Entropy-Based Detection?
 
-Different DDoS attack types have different signatures:
-- **Volumetric Attacks:** High BPS, moderate PPS
-- **Protocol Attacks:** High PPS, moderate BPS
-- **Application Layer:** High FPS, many unique sources
-- **Distributed Attacks:** Many unique sources
+Traditional threshold-based detection can miss attacks or generate false positives. Entropy-based detection provides:
 
-Using multiple metrics ensures broad attack detection.
+**Benefits:**
+- **Attack Classification:** Distinguish DoS (single source) from DDoS (distributed)
+- **Adaptive Detection:** Works across different attack scales
+- **Behavior Analysis:** Focuses on traffic distribution, not just volume
+- **Reduced False Positives:** High legitimate traffic won't trigger alerts alone
 
-### 3. Why Cooldown Periods?
+**Attack Signatures:**
+- **DDoS (High Entropy):** Traffic evenly distributed across many sources
+- **DoS (Low Entropy):** Traffic concentrated from few sources
+- **Normal Traffic:** Usually has moderate entropy with organic patterns
+
+Combining entropy with AbuseIPDB provides both behavior-based and reputation-based detection.
+
+### 3. Why AbuseIPDB Integration?
+
+**Advantages:**
+- **Reduced False Positives:** Known bad IPs trigger alerts even with low entropy
+- **Early Detection:** Identify attacks from known malicious actors quickly
+- **Rich Context:** ISP, country, and history information for investigations
+- **API Efficiency:** Smart quota management stops after first reported IP
+
+**Trade-offs:**
+- Optional dependency (works without API key)
+- API rate limits (1,000/day free tier)
+- External service dependency
+- Privacy considerations (IP sharing)
+
+**When to Use:**
+- Production environments with known attack patterns
+- Networks with external-facing services
+- Organizations with security requirements
+- Environments needing audit trails
+
+### 4. Why Cooldown Periods?
 
 Without cooldown:
 - Alert spam during ongoing attacks
@@ -189,7 +327,7 @@ With cooldown:
 - Follow-up alerts if attack continues
 - Balanced between awareness and noise
 
-### 4. Why Environment Variables + Config Files?
+### 5. Why Environment Variables + Config Files?
 
 **Config Files:**
 - Good for static settings
@@ -203,7 +341,7 @@ With cooldown:
 
 Using both provides flexibility for different deployment scenarios.
 
-### 5. Why Docker?
+### 6. Why Docker?
 
 **Benefits:**
 - Consistent deployment environment
@@ -244,18 +382,24 @@ Using both provides flexibility for different deployment scenarios.
 
 ### 2. Memory Usage
 - Stateless design (minimal memory footprint)
-- No large data caching
+- No large data caching (except cooldown tracking)
 - Connection pooling in ClickHouse client
+- Limited source IP list size from queries
 
 ### 3. CPU Usage
 - Simple threshold comparisons
-- No complex calculations
+- Lightweight entropy calculations (logarithmic operations)
 - Efficient Python data structures
+- Minimal AbuseIPDB API overhead
 
 ### 4. Network Usage
 - Batch notifications where possible
 - Configurable check intervals
 - Cooldown reduces duplicate traffic
+- AbuseIPDB API quota management:
+  - Stops after first reported IP
+  - Typically 1-10 API calls per detection cycle
+  - Respects rate limits (1,000/day free tier)
 
 ## Scalability
 
@@ -300,6 +444,14 @@ Potential improvements:
 6. **Metrics Export:** Prometheus/Grafana integration
 7. **Alert Aggregation:** Combine related attacks
 8. **Automatic Response:** Integration with mitigation systems
+9. **Enhanced AbuseIPDB:**
+   - Cache results to reduce API calls
+   - Configurable abuse score thresholds
+   - Report attacks back to AbuseIPDB
+10. **Advanced Entropy Analysis:**
+   - Time-series entropy tracking
+   - Baseline learning for normal entropy patterns
+   - Multi-dimensional entropy (IP, port, protocol)
 
 ## Deployment Patterns
 

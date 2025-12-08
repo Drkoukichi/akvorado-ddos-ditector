@@ -43,6 +43,15 @@ notifications:
   # Minimum time between notifications for the same target (seconds)
   cooldown: 300
 
+# AbuseIPDB Configuration
+abuseipdb:
+  # API key for AbuseIPDB (get from https://www.abuseipdb.com/)
+  # Leave empty to disable AbuseIPDB checks
+  api_key: ""
+  
+  # Maximum age of reports to consider (in days)
+  max_age_days: 90
+
 # Logging
 logging:
   level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL

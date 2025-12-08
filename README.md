@@ -5,11 +5,13 @@ A Python-based DDoS detection system that monitors network flow data from Akvora
 ## Features
 
 - 🔍 **Real-time DDoS Detection** - Monitors network flows for suspicious patterns
-- 📊 **Multiple Detection Metrics** - Analyzes packets per second, bytes per second, unique sources, and flows per second
+- 📊 **Multiple Detection Metrics** - Analyzes traffic volume, entropy, and source distribution
+- 🚫 **AbuseIPDB Integration** - Validates source IPs against known malicious IP database
 - 🔔 **Multi-channel Notifications** - Supports Discord and Slack webhooks
 - 🐳 **Docker Support** - Easy deployment with Docker and Docker Compose
 - ⚙️ **Flexible Configuration** - Configure via YAML file or environment variables
 - 📝 **Detailed Logging** - Comprehensive logging for monitoring and debugging
+- 💰 **API Quota Management** - Intelligent API usage to minimize external service calls
 
 ## How It Works
 
@@ -25,7 +27,17 @@ The detector uses a three-step approach to identify DoS and DDoS attacks:
    - Identifies destination IPs with traffic exceeding 1 Gbps (configurable)
    - Collects source IP distribution data
 
-3. **Attack Classification**
+3. **AbuseIPDB Verification** (Optional)
+   - Checks source IPs against AbuseIPDB for known malicious activity
+   - Stops API calls after first reported IP found (quota saving)
+   - Provides abuse confidence score and report count
+
+4. **Alert Triggers**
+   - **Trigger 1**: Source IP found in AbuseIPDB with reports
+   - **Trigger 2**: High entropy (> 0.8) indicating distributed attack
+   - Attack is flagged if **either** condition is met
+
+5. **Attack Classification**
    - Calculates **Normalized Entropy** of source IP distribution
    - **High Entropy (> 0.8)**: Traffic distributed across many sources → **DDoS Attack**
    - **Low Entropy (≤ 0.8)**: Traffic concentrated in few sources → **DoS Attack**
@@ -36,7 +48,15 @@ Normalized entropy measures how evenly distributed the attack traffic is across 
 - **DDoS**: Many attackers, high entropy (distributed attack)
 - **DoS**: Single or few attackers, low entropy (concentrated attack)
 
-When attacks are detected, alerts are sent to configured notification channels (Discord/Slack) with attack type, traffic volume, entropy value, and source count.
+### AbuseIPDB Integration
+
+The detector can optionally validate source IPs against [AbuseIPDB](https://www.abuseipdb.com/), a database of reported malicious IPs:
+- **Smart Detection**: Alerts even with low entropy if source IP is known to be malicious
+- **API Quota Saving**: Stops checking after first reported IP is found
+- **Rich Context**: Provides abuse score, report count, ISP, and country information
+- **Optional**: Works without API key using entropy-only detection
+
+When attacks are detected, alerts are sent to configured notification channels (Discord/Slack) with attack type, traffic volume, entropy value, source count, and AbuseIPDB information (if available).
 
 ## Prerequisites
 
@@ -135,6 +155,10 @@ detection:
     # Step 3: Entropy threshold for DoS vs DDoS classification
     entropy_threshold: 0.8  # > 0.8 = DDoS, ≤ 0.8 = DoS
 
+abuseipdb:
+  api_key: ""              # Your AbuseIPDB API key (leave empty to disable)
+  max_age_days: 90         # Consider reports from last 90 days
+
 notifications:
   discord_webhook: "https://discord.com/api/webhooks/..."
   slack_webhook: "https://hooks.slack.com/services/..."
@@ -148,8 +172,43 @@ All configuration options can be set via environment variables:
 - `CLICKHOUSE_HOST`, `CLICKHOUSE_PORT`, `CLICKHOUSE_DATABASE`, `CLICKHOUSE_USER`, `CLICKHOUSE_PASSWORD`
 - `CHECK_INTERVAL`, `TIME_WINDOW`
 - `TOTAL_EXTERNAL_BPS_THRESHOLD`, `DST_BPS_THRESHOLD`, `ENTROPY_THRESHOLD`
+- `ABUSEIPDB_API_KEY`, `ABUSEIPDB_MAX_AGE_DAYS`
 - `DISCORD_WEBHOOK`, `SLACK_WEBHOOK`, `NOTIFICATION_COOLDOWN`
 - `LOG_LEVEL`, `LOG_FILE`
+
+## Setting Up AbuseIPDB (Optional)
+
+AbuseIPDB integration enhances detection by validating source IPs against a database of reported malicious activity.
+
+### Getting an API Key
+
+1. Go to [AbuseIPDB](https://www.abuseipdb.com/)
+2. Create a free account
+3. Navigate to your [API settings](https://www.abuseipdb.com/account/api)
+4. Copy your API key
+5. Add it to your configuration:
+   ```yaml
+   abuseipdb:
+     api_key: "your_api_key_here"
+     max_age_days: 90
+   ```
+   Or as environment variable:
+   ```bash
+   ABUSEIPDB_API_KEY=your_api_key_here
+   ```
+
+### API Usage and Limits
+
+- **Free Tier**: 1,000 requests per day
+- **Smart Quota Management**: The detector stops API calls after finding the first reported IP
+- **Optional Feature**: The detector works without AbuseIPDB, using entropy-only detection
+- **Recommended**: Enable for production environments to reduce false positives
+
+### Benefits
+
+- **Fewer False Positives**: Known malicious IPs trigger alerts even with low entropy
+- **Rich Context**: Get ISP, country, and abuse history information
+- **Early Detection**: Identify attacks from known bad actors quickly
 
 ## Setting Up Webhooks
 
