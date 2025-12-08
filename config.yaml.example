@@ -1,0 +1,48 @@
+# Configuration file for DDoS Detection System
+# Copy this file to config.yaml and adjust the values
+
+# ClickHouse Database Configuration (Akvorado)
+clickhouse:
+  host: "localhost"
+  port: 9000
+  database: "flows"
+  user: "default"
+  password: ""
+
+# Detection Settings
+detection:
+  # Check interval in seconds
+  check_interval: 60
+  
+  # Time window for analysis in seconds
+  time_window: 300
+  
+  # Thresholds for DDoS detection
+  thresholds:
+    # Packets per second threshold
+    pps_threshold: 100000
+    
+    # Bytes per second threshold (in bytes)
+    bps_threshold: 1000000000  # 1 Gbps
+    
+    # Number of unique source IPs threshold
+    unique_sources_threshold: 1000
+    
+    # Flows per second threshold
+    fps_threshold: 10000
+
+# Notification Settings
+notifications:
+  # Discord webhook URL (leave empty to disable)
+  discord_webhook: ""
+  
+  # Slack webhook URL (leave empty to disable)
+  slack_webhook: ""
+  
+  # Minimum time between notifications for the same target (seconds)
+  cooldown: 300
+
+# Logging
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  file: "ddos_detector.log"

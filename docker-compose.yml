@@ -1,0 +1,75 @@
+services:
+  ddos-detector:
+    build: .
+    container_name: akvorado-ddos-detector
+    restart: unless-stopped
+    
+    # Environment variables (override these in .env file or here)
+    environment:
+      # ClickHouse Configuration
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=9000
+      - CLICKHOUSE_DATABASE=flows
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=
+      
+      # Detection Settings
+      - CHECK_INTERVAL=60
+      - TIME_WINDOW=300
+      - PPS_THRESHOLD=100000
+      - BPS_THRESHOLD=1000000000
+      - UNIQUE_SOURCES_THRESHOLD=1000
+      - FPS_THRESHOLD=10000
+      
+      # Notification Settings (set these to your webhook URLs)
+      - DISCORD_WEBHOOK=${DISCORD_WEBHOOK:-}
+      - SLACK_WEBHOOK=${SLACK_WEBHOOK:-}
+      - NOTIFICATION_COOLDOWN=300
+      
+      # Logging
+      - LOG_LEVEL=INFO
+      - LOG_FILE=/app/logs/ddos_detector.log
+    
+    # Volumes for configuration and logs
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./logs:/app/logs
+    
+    # Network - adjust to match your Akvorado network
+    networks:
+      - akvorado-network
+    
+    # Depends on ClickHouse being available
+    depends_on:
+      - clickhouse
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+  
+  # Example ClickHouse service (if not already running)
+  # Comment this out if you're using an existing Akvorado deployment
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: clickhouse
+    ports:
+      - "9000:9000"
+      - "8123:8123"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    networks:
+      - akvorado-network
+    environment:
+      - CLICKHOUSE_DB=flows
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=
+
+networks:
+  akvorado-network:
+    driver: bridge
+
+volumes:
+  clickhouse-data:
