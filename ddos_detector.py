@@ -58,6 +58,11 @@ class Config:
         config['notifications']['slack_webhook'] = os.getenv('SLACK_WEBHOOK', config.get('notifications', {}).get('slack_webhook', ''))
         config['notifications']['cooldown'] = int(os.getenv('NOTIFICATION_COOLDOWN', config.get('notifications', {}).get('cooldown', 300)))
         
+        config.setdefault('abuseipdb', {})
+        config['abuseipdb']['enabled'] = os.getenv('ABUSEIPDB_ENABLED', str(config.get('abuseipdb', {}).get('enabled', 'false'))).lower() == 'true'
+        config['abuseipdb']['api_key'] = os.getenv('ABUSEIPDB_API_KEY', config.get('abuseipdb', {}).get('api_key', ''))
+        config['abuseipdb']['max_age_days'] = int(os.getenv('ABUSEIPDB_MAX_AGE_DAYS', config.get('abuseipdb', {}).get('max_age_days', 90)))
+        
         config.setdefault('logging', {})
         config['logging']['level'] = os.getenv('LOG_LEVEL', config.get('logging', {}).get('level', 'INFO'))
         config['logging']['file'] = os.getenv('LOG_FILE', config.get('logging', {}).get('file', 'ddos_detector.log'))
@@ -280,6 +285,20 @@ class NotificationManager:
         
         return (datetime.now() - last_time).total_seconds() >= cooldown
     
+    def send_startup_notification(self, stats_summary: Dict, abuse_check: Optional[Dict] = None):
+        """Send startup notification to configured channels"""
+        message = self._format_startup_message(stats_summary, abuse_check)
+        
+        # Send to Discord
+        discord_webhook = self.config.get('notifications', 'discord_webhook')
+        if discord_webhook:
+            self._send_discord_startup(discord_webhook, message, stats_summary)
+        
+        # Send to Slack
+        slack_webhook = self.config.get('notifications', 'slack_webhook')
+        if slack_webhook:
+            self._send_slack_startup(slack_webhook, message, stats_summary)
+    
     def send_alert(self, attack_info: Dict):
         """Send DDoS alert to configured notification channels"""
         target = attack_info['dst_ip']
@@ -303,6 +322,39 @@ class NotificationManager:
         
         # Update last notification time
         self.last_notifications[target] = datetime.now()
+    
+    def _format_startup_message(self, stats_summary: Dict, abuse_check: Optional[Dict] = None) -> str:
+        """Format startup notification message"""
+        message = (
+            f"✅ **DDoS Detector Started Successfully** ✅\n\n"
+            f"**Start Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"**Status:** Monitoring Active\n\n"
+            f"**📊 Current Traffic Summary:**\n"
+            f"**Total External Traffic:** {stats_summary.get('total_bps', 0)/1000000000:.2f} Gbps\n"
+            f"**Top Destinations:** {stats_summary.get('top_destinations_count', 0)}\n"
+            f"**Active Attacks:** {stats_summary.get('attacks_detected', 0)}\n"
+        )
+        
+        if stats_summary.get('top_destination'):
+            top = stats_summary['top_destination']
+            message += (
+                f"\n**🎯 Top Destination:**\n"
+                f"**IP:** {top.get('dst_ip')}\n"
+                f"**Traffic:** {top.get('bps', 0)/1000000000:.2f} Gbps\n"
+                f"**Unique Sources:** {top.get('unique_sources', 0):,}\n"
+            )
+        
+        if abuse_check:
+            message += (
+                f"\n**🔍 Sample Source IP Check (AbuseIPDB):**\n"
+                f"**IP:** {abuse_check.get('ip_address')}\n"
+                f"**Total Reports:** {abuse_check.get('total_reports', 0)}\n"
+                f"**Abuse Score:** {abuse_check.get('abuse_confidence_score', 0)}%\n"
+                f"**Country:** {abuse_check.get('country_code', 'Unknown')}\n"
+                f"**ISP:** {abuse_check.get('isp', 'Unknown')}\n"
+            )
+        
+        return message
     
     def _format_message(self, attack_info: Dict) -> str:
         """Format alert message"""
@@ -333,6 +385,31 @@ class NotificationManager:
             message += f"\n**⚠️ Alert Reason:** High source IP entropy detected\n"
         
         return message
+    
+    def _send_discord_startup(self, webhook_url: str, message: str, stats_summary: Dict):
+        """Send startup notification to Discord"""
+        try:
+            # Green color for startup
+            color = 0x00FF00 if stats_summary.get('attacks_detected', 0) == 0 else 0xFFCC00
+            
+            payload = {
+                "embeds": [{
+                    "title": "✅ DDoS Detector Started",
+                    "description": message,
+                    "color": color,
+                    "timestamp": datetime.now().isoformat(),
+                    "footer": {
+                        "text": "Akvorado DDoS Detector"
+                    }
+                }]
+            }
+            
+            response = requests.post(webhook_url, json=payload, timeout=10)
+            response.raise_for_status()
+            logging.info("Discord startup notification sent")
+            
+        except Exception as e:
+            logging.error(f"Failed to send Discord startup notification: {e}")
     
     def _send_discord(self, webhook_url: str, message: str, attack_info: Dict):
         """Send notification to Discord"""
@@ -365,6 +442,29 @@ class NotificationManager:
             
         except Exception as e:
             logging.error(f"Failed to send Discord notification: {e}")
+    
+    def _send_slack_startup(self, webhook_url: str, message: str, stats_summary: Dict):
+        """Send startup notification to Slack"""
+        try:
+            # Good color for startup
+            color = "good" if stats_summary.get('attacks_detected', 0) == 0 else "warning"
+            
+            payload = {
+                "attachments": [{
+                    "color": color,
+                    "title": "✅ DDoS Detector Started",
+                    "text": message,
+                    "footer": "Akvorado DDoS Detector",
+                    "ts": int(datetime.now().timestamp())
+                }]
+            }
+            
+            response = requests.post(webhook_url, json=payload, timeout=10)
+            response.raise_for_status()
+            logging.info("Slack startup notification sent")
+            
+        except Exception as e:
+            logging.error(f"Failed to send Slack startup notification: {e}")
     
     def _send_slack(self, webhook_url: str, message: str, attack_info: Dict):
         """Send notification to Slack"""
@@ -544,12 +644,61 @@ class DDoSDetector:
         
         return attacks
     
+    def get_startup_stats(self) -> Dict:
+        """Get current traffic statistics for startup notification"""
+        try:
+            time_window = self.config.get('detection', 'time_window')
+            
+            # Get total external traffic
+            total_bps = self.db_client.get_total_external_traffic(time_window)
+            
+            # Get destination statistics
+            dst_stats = self.db_client.get_dst_traffic_stats(time_window)
+            
+            # Check for current attacks
+            attacks = self.detect_attacks()
+            
+            stats_summary = {
+                'total_bps': total_bps,
+                'top_destinations_count': len(dst_stats),
+                'attacks_detected': len(attacks),
+                'top_destination': dst_stats[0] if dst_stats else None
+            }
+            
+            # Try to check one source IP with AbuseIPDB if available
+            abuse_check = None
+            if dst_stats and dst_stats[0].get('src_ips'):
+                sample_ip = dst_stats[0]['src_ips'][0]
+                if self.abuse_client:
+                    abuse_check = self.abuse_client.check_ip(sample_ip)
+            
+            return stats_summary, abuse_check
+            
+        except Exception as e:
+            logging.error(f"Failed to get startup stats: {e}")
+            return {
+                'total_bps': 0,
+                'top_destinations_count': 0,
+                'attacks_detected': 0,
+                'top_destination': None
+            }, None
+    
     def run(self):
         """Main detection loop"""
         check_interval = self.config.get('detection', 'check_interval')
         
         logging.info("DDoS Detector started")
         logging.info(f"Check interval: {check_interval}s, Time window: {self.config.get('detection', 'time_window')}s")
+        
+        # Send startup notification
+        try:
+            stats_summary, abuse_check = self.get_startup_stats()
+            self.notifier.send_startup_notification(stats_summary, abuse_check)
+            logging.info("Startup notification sent")
+        except Exception as e:
+            logging.error(f"Failed to send startup notification: {e}")
+        
+        logging.info("Starting detection loop...")
         
         while True:
             try:
