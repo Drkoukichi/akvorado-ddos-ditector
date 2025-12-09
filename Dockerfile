@@ -9,7 +9,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application files
 COPY ddos_detector.py .
-COPY config.yaml.example .
 
 # Create directory for logs
 RUN mkdir -p /app/logs
