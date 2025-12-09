@@ -133,10 +133,15 @@ class ClickHouseClient:
               AND InIfBoundary = 'external'
             """
             
+            logging.debug(f"Query: {query}")
             result = self.client.query(query)
+            logging.debug(f"Result rows: {result.result_rows}")
             
             if result.result_rows and len(result.result_rows) > 0:
-                return float(result.result_rows[0][0] or 0)
+                bps = float(result.result_rows[0][0] or 0)
+                logging.info(f"Total external traffic: {NotificationManager.format_traffic(bps)}")
+                return bps
+            logging.warning("No traffic data found")
             return 0.0
             
         except Exception as e:
@@ -174,7 +179,9 @@ class ClickHouseClient:
             LIMIT 100
             """
             
+            logging.debug(f"Query: {query}")
             result = self.client.query(query)
+            logging.debug(f"Result rows count: {len(result.result_rows)}")
             
             stats = []
             for row in result.result_rows:
@@ -186,6 +193,7 @@ class ClickHouseClient:
                     'unique_sources': int(row[4])
                 })
             
+            logging.info(f"Found {len(stats)} destinations with traffic > 1 Mbps")
             return stats
             
         except Exception as e:
@@ -275,6 +283,18 @@ class NotificationManager:
         self.config = config
         self.last_notifications: Dict[str, datetime] = {}
     
+    @staticmethod
+    def format_traffic(bps: float) -> str:
+        """Format traffic with appropriate unit (bps, Kbps, Mbps, Gbps)"""
+        if bps >= 1_000_000_000:
+            return f"{bps/1_000_000_000:.2f} Gbps"
+        elif bps >= 1_000_000:
+            return f"{bps/1_000_000:.2f} Mbps"
+        elif bps >= 1_000:
+            return f"{bps/1_000:.2f} Kbps"
+        else:
+            return f"{bps:.2f} bps"
+    
     def _should_notify(self, target: str) -> bool:
         """Check if enough time has passed since last notification for this target"""
         cooldown = self.config.get('notifications', 'cooldown')
@@ -325,22 +345,24 @@ class NotificationManager:
     
     def _format_startup_message(self, stats_summary: Dict, abuse_check: Optional[Dict] = None) -> str:
         """Format startup notification message"""
+        total_traffic = self.format_traffic(stats_summary.get('total_bps', 0))
         message = (
             f"✅ **DDoS Detector Started Successfully** ✅\n\n"
             f"**Start Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"**Status:** Monitoring Active\n\n"
             f"**📊 Current Traffic Summary:**\n"
-            f"**Total External Traffic:** {stats_summary.get('total_bps', 0)/1000000000:.2f} Gbps\n"
+            f"**Total External Traffic:** {total_traffic}\n"
             f"**Top Destinations:** {stats_summary.get('top_destinations_count', 0)}\n"
             f"**Active Attacks:** {stats_summary.get('attacks_detected', 0)}\n"
         )
         
         if stats_summary.get('top_destination'):
             top = stats_summary['top_destination']
+            top_traffic = self.format_traffic(top.get('bps', 0))
             message += (
                 f"\n**🎯 Top Destination:**\n"
                 f"**IP:** {top.get('dst_ip')}\n"
-                f"**Traffic:** {top.get('bps', 0)/1000000000:.2f} Gbps\n"
+                f"**Traffic:** {top_traffic}\n"
                 f"**Unique Sources:** {top.get('unique_sources', 0):,}\n"
             )
         
@@ -360,11 +382,13 @@ class NotificationManager:
         """Format alert message"""
         attack_type = attack_info.get('attack_type', 'DDoS')
         emoji = "🚨" if attack_type == "DDoS" else "⚠️"
+        traffic = self.format_traffic(attack_info['bps'])
         
         message = (
             f"{emoji} **{attack_type} Attack Detected!** {emoji}\n\n"
             f"**Target IP:** {attack_info['dst_ip']}\n"
-            f"**Bytes/sec:** {attack_info['bps']:,.0f} ({attack_info['bps']/1000000000:.2f} Gbps)\n"
+            f"**Traffic Rate:** {traffic}\n"
+            f"**Bytes/sec:** {attack_info['bps']:,.0f}\n"
             f"**Entropy:** {attack_info.get('entropy', 0):.4f}\n"
             f"**Unique Sources:** {attack_info.get('unique_sources', 0):,}\n"
             f"**Time:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
@@ -559,13 +583,13 @@ class DDoSDetector:
         total_external_bps = self.db_client.get_total_external_traffic(time_window)
         total_threshold = thresholds.get('total_external_bps_threshold', 1000000000)
         
-        logging.debug(f"Total external traffic: {total_external_bps/1000000000:.2f} Gbps (threshold: {total_threshold/1000000000:.2f} Gbps)")
+        logging.debug(f"Total external traffic: {NotificationManager.format_traffic(total_external_bps)} (threshold: {NotificationManager.format_traffic(total_threshold)})")
         
         if total_external_bps <= total_threshold:
             logging.debug("Total external traffic below threshold, no further checks needed")
             return []
         
-        logging.info(f"Total external traffic exceeds threshold: {total_external_bps/1000000000:.2f} Gbps")
+        logging.info(f"Total external traffic exceeds threshold: {NotificationManager.format_traffic(total_external_bps)}")
         
         # Step 2: Check per-destination traffic
         dst_stats = self.db_client.get_dst_traffic_stats(time_window)
@@ -636,7 +660,7 @@ class DDoSDetector:
                     attacks.append(attack_info)
                     logging.warning(
                         f"{attack_type} attack detected: {stat['dst_ip']} - "
-                        f"{stat['bps']/1000000000:.2f} Gbps, "
+                        f"{NotificationManager.format_traffic(stat['bps'])}, "
                         f"entropy: {entropy:.4f}, "
                         f"sources: {stat['unique_sources']}, "
                         f"abuse_reported: {abuse_info is not None}"
@@ -669,8 +693,8 @@ class DDoSDetector:
             abuse_check = None
             if dst_stats and dst_stats[0].get('src_ips'):
                 sample_ip = dst_stats[0]['src_ips'][0]
-                if self.abuse_client:
-                    abuse_check = self.abuse_client.check_ip(sample_ip)
+                if self.abuseipdb_client and self.abuseipdb_client.enabled:
+                    abuse_check = self.abuseipdb_client.check_ip(sample_ip)
             
             return stats_summary, abuse_check
             
