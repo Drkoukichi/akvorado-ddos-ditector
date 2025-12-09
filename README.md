@@ -8,6 +8,7 @@ A Python-based DDoS detection system that monitors network flow data from Akvora
 - 📊 **Multiple Detection Metrics** - Analyzes traffic volume, entropy, and source distribution
 - 🚫 **AbuseIPDB Integration** - Validates source IPs against known malicious IP database
 - 🔔 **Multi-channel Notifications** - Supports Discord and Slack webhooks
+- 🚀 **Startup Notifications** - Sends traffic summary with AbuseIPDB check on startup
 - 🐳 **Docker Support** - Easy deployment with Docker and Docker Compose
 - ⚙️ **Flexible Configuration** - Configure via YAML file or environment variables
 - 📝 **Detailed Logging** - Comprehensive logging for monitoring and debugging
